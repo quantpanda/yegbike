@@ -82,3 +82,6 @@ Desktop.ini
 #libraries
 myenv/
 lib/
+
+# App cache (regenerated from the API on demand)
+cache/
