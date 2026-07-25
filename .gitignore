@@ -1,0 +1,84 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# R / RStudio
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+.Rapp.history
+*.Rout
+.httr-oauth
+
+# rsconnect deployment metadata
+rsconnect/
+
+# Quarto
+/.quarto/
+_freeze/
+*_files/
+*_cache/
+/*_cache/
+
+# R package build artifacts
+*.tar.gz
+src/*.o
+src/*.so
+src/*.dll
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# Jupyter
+*.ipynb_checkpoints
+
+# Node (in case of JS tooling, e.g. GitHub Pages site)
+node_modules/
+npm-debug.log*
+
+# Docker
+*.log
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment / secrets
+.env
+.env.local
+.Renviron
+
+# OS-generated
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Data
+*.csv
+*.json
+*.xlsx
+*.xls
+*.rda
+
+# rendered
+*.html
+*.pdf
+
+#libraries
+myenv/
+lib/
