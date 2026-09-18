@@ -16,11 +16,21 @@ app_data <- function(force = FALSE, notify = NULL) {
   step("Bike routes", 0.05)
   routes <- try_layer(load_routes(force))
 
-  step("Daily counts", 0.25)
-  daily <- try_layer(load_daily(force))
+  # The Map tab gets its own simplified copy. Prefer the one built at deploy
+  # time; simplifying 9,860 features at startup costs a couple of seconds.
+  map_routes <- seed_rds("routes_simplified")
+  if (is.null(map_routes) && !is.null(routes)) {
+    step("Preparing map geometry", 0.15)
+    map_routes <- try_layer(simplify_routes(routes), fallback = routes)
+  }
 
-  step("Sensor outages", 0.50)
-  outages <- try_layer(load_outages(force), fallback = data.frame())
+  # Counts and outage flags come from one rollup query, so they are fetched
+  # together rather than through load_daily()/load_outages() individually.
+  step("Counter readings", 0.30)
+  both    <- try_layer(load_counts_and_outages(force), fallback = list())
+  daily   <- both$counts
+  outages <- both$outages %||% data.frame()
+  if (is.null(daily)) stop("no counter data available")
 
   step("Counter details", 0.65)
   meta <- try_layer(load_counter_meta(force), fallback = data.frame())
@@ -46,6 +56,7 @@ app_data <- function(force = FALSE, notify = NULL) {
   step("Ready", 1)
   list(
     routes       = routes,
+    map_routes   = map_routes %||% routes,
     counts       = cleaned$data,
     ledger       = cleaned$ledger,
     qa_summary   = cleaned$summary,

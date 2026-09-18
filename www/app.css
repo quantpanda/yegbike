@@ -96,7 +96,21 @@ body {
 /* -- page scaffolding ----------------------------------------------------- */
 
 .page { padding: 22px 24px 34px; max-width: 1500px; margin: 0 auto; }
-.page-flush { padding: 0; max-width: none; height: 100%; }
+/* Full-bleed tabs (Map, Simulation).
+   A concrete viewport height rather than height:100%, because 100% only works
+   if every ancestor participates in bslib's fill chain -- and shinycssloaders
+   wraps its output in a plain div, which breaks it. The subtracted 92px is the
+   navbar plus the status bar. */
+.page-flush {
+  padding: 0;
+  max-width: none;
+  height: calc(100vh - 92px);
+  min-height: 460px;
+}
+/* Pass the height down through the wrappers bslib does not control. */
+.page-flush > .bslib-sidebar-layout { height: 100%; margin-bottom: 0 !important; }
+.page-flush .shiny-spinner-output-container { height: 100%; }
+.page-flush .leaflet { min-height: 400px; }
 
 .page-head { margin-bottom: 18px; }
 .page-head h2 { font-size: 21px; font-weight: 650; letter-spacing: -0.015em; margin: 0 0 3px; }

@@ -25,15 +25,63 @@ DATASETS <- list(
   counters    = list(id = "py7x-4d39", ttl = 7 * 24 * 3600, label = "Bike Counter Locations (Eco Counter)")
 )
 
-CACHE_DIR <- "cache"
 PAGE_SIZE <- 50000L
+
+# Where fetched data is cached between runs.
+#
+# Resolved at load time rather than hard-coded, because a hosted deployment
+# (shinyapps.io, Connect, a container) may hand us a read-only app directory.
+# When that happens we fall back to the session's temp directory: the cache
+# then lasts only as long as the process, which costs one refetch per instance
+# and is very much better than failing to start.
+#
+# Override with YEGBIKE_CACHE_DIR to point at a persistent volume.
+resolve_cache_dir <- function() {
+  env <- Sys.getenv("YEGBIKE_CACHE_DIR", "")
+  candidates <- c(if (nzchar(env)) env, "cache", file.path(tempdir(), "yegbike-cache"))
+  for (d in candidates) {
+    ok <- tryCatch({
+      dir.create(d, showWarnings = FALSE, recursive = TRUE)
+      f <- file.path(d, ".write-test")
+      writeLines("x", f); unlink(f)
+      TRUE
+    }, error = function(e) FALSE, warning = function(w) FALSE)
+    if (isTRUE(ok)) return(d)
+  }
+  # Nothing is writable: run cache-less. Reads will miss, writes will no-op.
+  NA_character_
+}
+
+CACHE_DIR <- resolve_cache_dir()
 
 # Populated by fetch_soql() so the UI can report what came from the network and
 # what came from disk after a failure.
 .fetch_state <- new.env(parent = emptyenv())
 .fetch_state$log <- list()
 
-cache_path <- function(key) file.path(CACHE_DIR, paste0(key, ".rds"))
+cache_path <- function(key) {
+  if (is.na(CACHE_DIR)) return(NA_character_)
+  file.path(CACHE_DIR, paste0(key, ".rds"))
+}
+
+#' Write to the cache, treating failure as a miss rather than an error.
+#'
+#' A cache is an optimisation. Losing it must never take the app down, so a
+#' full disk or a read-only mount degrades to "slower" instead of "broken".
+cache_write <- function(obj, path) {
+  if (is.na(path)) return(invisible(FALSE))
+  ok <- tryCatch({
+    dir.create(dirname(path), showWarnings = FALSE, recursive = TRUE)
+    saveRDS(obj, path)
+    TRUE
+  }, error = function(e) {
+    warning(sprintf("could not write cache to %s: %s", path, conditionMessage(e)))
+    FALSE
+  }, warning = function(w) FALSE)
+  invisible(ok)
+}
+
+cache_exists <- function(path) !is.na(path) && file.exists(path)
 
 #' Note the outcome of one dataset fetch for the UI banner.
 record_fetch <- function(key, status, time = Sys.time(), rows = NA_integer_, msg = NULL) {
@@ -170,26 +218,27 @@ cached_fetch <- function(key, query, force = FALSE, seed = NULL, suffix = "") {
   ttl  <- if (is.null(spec)) 3600 else spec$ttl
   path <- cache_path(paste0(key, suffix))
 
-  if (!force && file.exists(path)) {
+  if (!force && cache_exists(path)) {
     age <- as.numeric(difftime(Sys.time(), file.mtime(path), units = "secs"))
     if (age < ttl) {
-      obj <- readRDS(path)
-      record_fetch(key, "cache", file.mtime(path), nrow_safe(obj))
-      return(obj)
+      obj <- tryCatch(readRDS(path), error = function(e) NULL)
+      if (!is.null(obj)) {
+        record_fetch(key, "cache", file.mtime(path), nrow_safe(obj))
+        return(obj)
+      }
     }
   }
 
   out <- tryCatch(query(), error = function(e) e)
 
   if (!inherits(out, "error")) {
-    dir.create(CACHE_DIR, showWarnings = FALSE, recursive = TRUE)
-    saveRDS(out, path)
+    cache_write(out, path)
     record_fetch(key, "live", Sys.time(), nrow_safe(out))
     return(out)
   }
 
   # Network failed. Fall back to whatever we have, loudly.
-  if (file.exists(path)) {
+  if (cache_exists(path)) {
     obj <- readRDS(path)
     record_fetch(key, "stale", file.mtime(path), nrow_safe(obj), conditionMessage(out))
     warning(sprintf("[%s] fetch failed (%s); using cache from %s",
@@ -210,6 +259,32 @@ cached_fetch <- function(key, query, force = FALSE, seed = NULL, suffix = "") {
 }
 
 nrow_safe <- function(x) if (is.data.frame(x)) nrow(x) else NA_integer_
+
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+# ---------------------------------------------------------------------------
+# Bundled seed data
+#
+# The last resort when the portal is unreachable and there is no cache -- which
+# on a hosted deployment is precisely the cold-start-during-an-outage case.
+# Shipped as compressed .rds under data/ rather than the original CSV exports:
+# 1.4 MB against 13.4 MB, and no re-parsing at startup. Generate with
+# scripts/build_deploy_data.R.
+# ---------------------------------------------------------------------------
+
+seed_rds <- function(name, dir = "data") {
+  f <- file.path(dir, paste0(name, ".rds"))
+  if (!file.exists(f)) return(NULL)
+  tryCatch(readRDS(f), error = function(e) NULL)
+}
+
+seed_csv <- function(file, transform) {
+  if (!file.exists(file)) return(NULL)
+  tryCatch(
+    transform(readr::read_csv(file, show_col_types = FALSE, progress = FALSE)),
+    error = function(e) NULL
+  )
+}
 
 # ---------------------------------------------------------------------------
 # Dataset-specific loaders
@@ -238,12 +313,10 @@ load_routes <- function(force = FALSE) {
       readr::read_csv(show_col_types = FALSE, progress = FALSE)
     routes_to_sf(df)
   }
-  seed <- function() {
-    f <- "Bike_Routes_20251013.csv"
-    if (!file.exists(f)) return(NULL)
-    routes_to_sf(readr::read_csv(f, show_col_types = FALSE, progress = FALSE))
-  }
-  cached_fetch("routes", query, force, seed)
+  cached_fetch("routes", query, force, seed = function() {
+    seed_rds("routes") %||%
+      seed_csv("Bike_Routes_20251013.csv", routes_to_sf)
+  })
 }
 
 routes_to_sf <- function(df) {
@@ -252,32 +325,159 @@ routes_to_sf <- function(df) {
   sf::st_as_sf(df, wkt = "geometry_line", crs = 4326)
 }
 
+DAILY_SELECT <- paste(
+  "counter_location_description", "latitude", "longitude",
+  "log_timstamp", "total_pedestrian_count", "total_cyclist_count",
+  sep = ", "
+)
+
+# One query against the 15-minute table that yields everything the daily view
+# needs: counts, position, and the outage flag, rolled up per sensor-day.
+#
+# The obvious source for daily counts is the daily dataset (sw7k-ptx8), and
+# that is what this used to use. But that endpoint is slow out of proportion to
+# its size -- a bare `select max(log_timstamp)` over 112k rows takes ten
+# seconds, and any filtered read is a full scan. The 15-minute table is 10.4M
+# rows and answers the same question in under two seconds, because Socrata
+# indexes it properly.
+#
+# The two agree exactly: 5,352 overlapping sensor-days compared, zero
+# mismatches on either measure. tq23 is in fact the cleaner of the two, being
+# the source the daily table is derived from -- it does not carry the 14
+# duplicated sensor-days that the rollup does.
+ROLLUP_SELECT <- paste(
+  "counter_location_description",
+  "date_trunc_ymd(log_timestamp) AS d",
+  "sum(total_cyclist_count) AS cyc",
+  "sum(total_pedestrian_count) AS ped",
+  "max(latitude) AS lat",
+  "max(longitude) AS lon",
+  "count(*) AS n_intervals",
+  "sum(case(out_of_service IS NOT NULL, 1, true, 0)) AS n_oos",
+  sep = ", "
+)
+ROLLUP_GROUP <- "counter_location_description, date_trunc_ymd(log_timestamp)"
+
+#' Counts and outages together, fetching the shared rollup only once.
+#'
+#' load_daily() and load_outages() each derive from the same query. Called
+#' independently they would run it twice; app_data() uses this instead.
+load_counts_and_outages <- function(force = FALSE) {
+  base_c <- baseline_daily()
+  base_o <- seed_rds("outages")
+  p_c <- cache_path("daily"); p_o <- cache_path("outages")
+
+  # Honour a warm cache before going near the network.
+  if (!force && cache_exists(p_c) && cache_exists(p_o)) {
+    ttl <- DATASETS$daily$ttl
+    fresh <- function(p) as.numeric(difftime(Sys.time(), file.mtime(p), units = "secs")) < ttl
+    if (fresh(p_c) && fresh(p_o)) {
+      cc <- tryCatch(readRDS(p_c), error = function(e) NULL)
+      oo <- tryCatch(readRDS(p_o), error = function(e) NULL)
+      if (!is.null(cc) && !is.null(oo)) {
+        record_fetch("daily", "cache", file.mtime(p_c), nrow(cc))
+        record_fetch("outages", "cache", file.mtime(p_o), nrow(oo))
+        return(list(counts = cc, outages = oo))
+      }
+    }
+  }
+
+  since <- if (force || is.null(base_c) || !nrow(base_c)) NULL else max(base_c$date, na.rm = TRUE)
+  got <- tryCatch(fetch_rollup(since), error = function(e) e)
+
+  if (inherits(got, "error") || is.null(got)) {
+    msg <- if (inherits(got, "error")) conditionMessage(got) else "no rows returned"
+    counts  <- if (cache_exists(p_c)) readRDS(p_c) else base_c
+    outages <- if (cache_exists(p_o)) readRDS(p_o) else base_o
+    if (is.null(counts)) stop(sprintf("could not fetch counts: %s", msg))
+    record_fetch("daily", if (cache_exists(p_c)) "stale" else "seed", NA, nrow(counts), msg)
+    record_fetch("outages", if (cache_exists(p_o)) "stale" else "seed", NA, nrow_safe(outages), msg)
+    return(list(counts = counts, outages = outages %||% base_o))
+  }
+
+  counts  <- merge_by_key(base_c, got$counts,  c("sensor_raw", "date"))
+  outages <- merge_by_key(base_o, got$outages, c("sensor_raw", "date"))
+  cache_write(counts, p_c); cache_write(outages, p_o)
+  record_fetch("daily", "live", Sys.time(), nrow(counts))
+  record_fetch("outages", "live", Sys.time(), nrow_safe(outages))
+  list(counts = counts, outages = outages)
+}
+
+#' Fetch the per-sensor-day rollup, optionally only after a date.
+fetch_rollup <- function(since = NULL) {
+  where <- if (is.null(since)) NULL else
+    sprintf("log_timestamp > '%sT00:00:00.000'", format(as.Date(since)))
+  df <- soql_fetch_csv(DATASETS$intraday$id, select = ROLLUP_SELECT,
+                       group = ROLLUP_GROUP, where = where)
+  if (!nrow(df)) return(NULL)
+  counts <- data.frame(
+    sensor_raw = as.character(df$counter_location_description),
+    lat = parse_count(df$lat), lon = parse_count(df$lon),
+    date = parse_ts(df$d),
+    ped = parse_count(df$ped), cyc = parse_count(df$cyc),
+    stringsAsFactors = FALSE
+  )
+  outages <- data.frame(
+    sensor_raw  = counts$sensor_raw,
+    date        = counts$date,
+    n_intervals = as.integer(parse_count(df$n_intervals)),
+    n_oos       = as.integer(parse_count(df$n_oos)),
+    stringsAsFactors = FALSE
+  )
+  list(counts = counts, outages = outages)
+}
+
 #' Daily pedestrian and cyclist counts, one row per sensor-day.
+#'
+#' Loads incrementally where it can. The series runs to 112,000 rows and takes
+#' the better part of a minute to pull in full, but all of it except the last
+#' few days is settled history -- so we ship a baseline as a deploy artifact
+#' and ask the portal only for what came after it. That turns a 38-second cold
+#' start into a request for a couple of hundred rows.
+#'
+#' `force = TRUE` (the Refresh button) always pulls the whole series. That is
+#' the escape hatch for the case incremental loading cannot see: the city
+#' occasionally revises history rather than only appending to it. They
+#' corrected a malfunctioning counter's 2022 readings this way.
 load_daily <- function(force = FALSE) {
   query <- function() {
-    df <- soql_fetch_csv(
-      DATASETS$daily$id,
-      select = "counter_location_description, latitude, longitude, log_timstamp, total_pedestrian_count, total_cyclist_count"
-    )
-    normalise_daily(df)
+    base <- if (force) NULL else baseline_daily()
+    since <- if (is.null(base) || !nrow(base)) NULL else max(base$date, na.rm = TRUE)
+    got <- tryCatch(fetch_rollup(since), error = function(e) NULL)
+    if (is.null(got)) {
+      if (!is.null(base) && nrow(base)) return(base)
+      stop("could not fetch counts and no baseline is available")
+    }
+    merge_by_key(base, got$counts, c("sensor_raw", "date"))
   }
-  seed <- function() {
-    f <- "Daily_Pedestrian_and_Bike_Counts_20251102.csv"
-    if (!file.exists(f)) return(NULL)
-    df <- readr::read_csv(f, show_col_types = FALSE, progress = FALSE)
-    normalise_daily(data.frame(
-      counter_location_description = df[["Counter Location Description"]],
-      latitude                     = df$Latitude,
-      longitude                    = df$Longitude,
-      # The portal CSV export writes "2025 Nov 01 12:00:00 AM"; the API returns
-      # ISO. normalise_daily() handles both.
-      log_timstamp                 = df$log_timstamp,
-      total_pedestrian_count       = df[["Total Pedestrian Count"]],
-      total_cyclist_count          = df[["Total Cyclist Count"]],
-      stringsAsFactors             = FALSE
-    ))
-  }
-  cached_fetch("daily", query, force, seed)
+  cached_fetch("daily", query, force, seed = baseline_daily)
+}
+
+#' The bundled starting point for the daily series.
+baseline_daily <- function() {
+  seed_rds("daily") %||%
+    seed_csv("Daily_Pedestrian_and_Bike_Counts_20251102.csv", function(df) {
+      normalise_daily(data.frame(
+        counter_location_description = df[["Counter Location Description"]],
+        latitude                     = df$Latitude,
+        longitude                    = df$Longitude,
+        # The portal CSV export writes "2025 Nov 01 12:00:00 AM"; the API
+        # returns ISO. normalise_daily() handles both.
+        log_timstamp                 = df$log_timstamp,
+        total_pedestrian_count       = df[["Total Pedestrian Count"]],
+        total_cyclist_count          = df[["Total Cyclist Count"]],
+        stringsAsFactors             = FALSE
+      ))
+    })
+}
+
+#' Append `new` to `old`, letting `new` win on shared keys.
+merge_by_key <- function(old, new, keys) {
+  if (is.null(new) || !nrow(new)) return(old)
+  if (is.null(old) || !nrow(old)) return(new)
+  k_old <- do.call(paste, c(old[keys], sep = "\r"))
+  k_new <- do.call(paste, c(new[keys], sep = "\r"))
+  rbind(old[!k_old %in% k_new, , drop = FALSE], new)
 }
 
 #' Coerce a count column to numeric.
@@ -325,25 +525,38 @@ normalise_daily <- function(df) {
 #' but the 15-minute table carries the city's own out_of_service flag. We push
 #' the aggregation server side -- counting 10.4M rows into ~110k sensor-days
 #' takes about a second and transfers a couple of MB.
+OUTAGE_SELECT <- paste(
+  "counter_location_description",
+  "date_trunc_ymd(log_timestamp) AS d",
+  "count(*) AS n_intervals",
+  "sum(case(out_of_service IS NOT NULL, 1, true, 0)) AS n_oos",
+  sep = ", "
+)
+OUTAGE_GROUP <- "counter_location_description, date_trunc_ymd(log_timestamp)"
+
+#' Per-sensor-day outage summary derived from the 15-minute table.
+#'
+#' Incremental for the same reason as load_daily: this aggregates 10.4M rows
+#' into 112k, which costs 26 seconds to transfer in full and is almost entirely
+#' unchanging history.
 load_outages <- function(force = FALSE) {
   query <- function() {
-    soql_fetch_csv(
-      DATASETS$intraday$id,
-      select = paste(
-        "counter_location_description",
-        "date_trunc_ymd(log_timestamp) AS d",
-        "count(*) AS n_intervals",
-        "sum(case(out_of_service IS NOT NULL, 1, true, 0)) AS n_oos",
-        sep = ", "
-      ),
-      group = "counter_location_description, date_trunc_ymd(log_timestamp)"
-    ) |> normalise_outages()
+    base <- if (force) NULL else seed_rds("outages")
+    since <- if (is.null(base) || !nrow(base)) NULL else max(base$date, na.rm = TRUE)
+    got <- tryCatch(fetch_rollup(since), error = function(e) NULL)
+    if (is.null(got)) {
+      if (!is.null(base) && nrow(base)) return(base)
+      stop("could not fetch outage flags")
+    }
+    merge_by_key(base, got$outages, c("sensor_raw", "date"))
   }
-  # No seed: without this the app still works, it just can't tell real zeros
-  # from dead sensors. An empty frame degrades R3 gracefully.
+
+  # Without any of this the app still runs; it just cannot tell a real zero
+  # from a dead counter, so R3 goes quiet. An empty frame degrades cleanly.
   cached_fetch("outages", query, force, seed = function() {
-    data.frame(sensor_raw = character(), date = as.Date(character()),
-               n_intervals = integer(), n_oos = integer())
+    seed_rds("outages") %||%
+      data.frame(sensor_raw = character(), date = as.Date(character()),
+                 n_intervals = integer(), n_oos = integer())
   })
 }
 

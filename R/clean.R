@@ -61,21 +61,58 @@ tidy_sensor_name <- function(x) {
 #' Build a map from raw sensor label to canonical sensor name.
 #'
 #' Two labels are the same counter when they sit at the same coordinates (to 5
-#' decimal places, about a metre). We pick the shortest tidied name as
-#' canonical. Deriving this from coordinates rather than a hard-coded alias
-#' list means future renames are handled without a code change.
+#' decimal places, about a metre) AND their date ranges do not overlap. Both
+#' conditions are required, and the second is not a formality: the city runs
+#' pairs of counters at a single site, one per direction, and publishes them at
+#' identical coordinates. `106 Street S of 61 Ave E` and `106 Street S of 61
+#' Avenue W` are two devices, not one renamed device, and merging them would
+#' hand R2 a pile of same-day collisions to "resolve" by throwing one
+#' direction away.
+#'
+#' A rename, by contrast, leaves a clean handover: the old label stops on one
+#' date and the new label starts after it.
+#'
+#' Deriving this from the data rather than a hard-coded alias list means future
+#' renames are handled without a code change -- which is the point, since this
+#' rule was written against 57 labels and the city has since published 62.
 sensor_alias_map <- function(daily) {
   by_label <- stats::aggregate(
     cbind(lat, lon) ~ sensor_raw, data = daily, FUN = function(v) round(stats::median(v), 5)
   )
-  by_label$key <- paste(by_label$lat, by_label$lon)
-  by_label$tidy <- tidy_sensor_name(by_label$sensor_raw)
+  rng <- stats::aggregate(date ~ sensor_raw, data = daily,
+                          FUN = function(v) c(min(v), max(v)))
+  by_label$first <- rng$date[match(by_label$sensor_raw, rng$sensor_raw), 1]
+  by_label$last  <- rng$date[match(by_label$sensor_raw, rng$sensor_raw), 2]
 
-  canon <- tapply(by_label$tidy, by_label$key, function(nms) {
-    u <- unique(nms)
-    u[order(nchar(u), u)][1]
-  })
-  by_label$sensor <- unname(canon[by_label$key])
+  by_label$key  <- paste(by_label$lat, by_label$lon)
+  by_label$tidy <- tidy_sensor_name(by_label$sensor_raw)
+  by_label$sensor <- by_label$tidy
+
+  for (k in unique(by_label$key)) {
+    idx <- which(by_label$key == k)
+    if (length(idx) < 2) next
+    g <- by_label[idx, ]
+    # Chronological order makes "does this one start after the last one ended"
+    # a single pass.
+    o <- order(g$first)
+    g <- g[o, ]; idx <- idx[o]
+
+    # Greedily chain labels whose ranges do not overlap. Anything that overlaps
+    # an existing chain starts a chain of its own, and so keeps its own name.
+    chain <- rep(NA_integer_, nrow(g))
+    chain[1] <- 1L
+    for (i in seq_len(nrow(g))[-1]) {
+      prev <- which(chain == chain[i - 1L])
+      if (g$first[i] > max(g$last[prev])) chain[i] <- chain[i - 1L]
+      else chain[i] <- max(chain, na.rm = TRUE) + 1L
+    }
+    for (cc in unique(chain)) {
+      members <- which(chain == cc)
+      if (length(members) < 2) next
+      nm <- unique(g$tidy[members])
+      by_label$sensor[idx[members]] <- nm[order(nchar(nm), nm)][1]
+    }
+  }
   by_label[, c("sensor_raw", "sensor", "lat", "lon")]
 }
 
@@ -189,8 +226,13 @@ clean_counts <- function(daily, outages = NULL, meta = NULL) {
   # -canonicalised data doesn't collide into sensor.x / sensor.y on the merge.
   daily <- daily[, setdiff(names(daily), "sensor"), drop = FALSE]
   aliases <- sensor_alias_map(daily)
-  d <- merge(daily, aliases[, c("sensor_raw", "sensor")], by = "sensor_raw", all.x = TRUE)
-  d$sensor[is.na(d$sensor)] <- tidy_sensor_name(d$sensor_raw[is.na(d$sensor)])
+  # match() rather than merge(): this is a lookup, and merge() sorts both
+  # frames to do it. Over 112k rows that sort was a measurable share of
+  # startup.
+  d <- daily
+  d$sensor <- aliases$sensor[match(d$sensor_raw, aliases$sensor_raw)]
+  miss <- is.na(d$sensor)
+  if (any(miss)) d$sensor[miss] <- tidy_sensor_name(d$sensor_raw[miss])
 
   renamed <- aliases[aliases$sensor_raw != aliases$sensor, ]
   if (nrow(renamed)) {
@@ -198,14 +240,12 @@ clean_counts <- function(daily, outages = NULL, meta = NULL) {
         paste("merged into", renamed$sensor))
   }
 
-  d <- d[order(d$sensor, d$date), ]
-
   # --- R2: duplicate (sensor, date) --------------------------------------
   # 14 pairs, all Feb-Mar 2019. They double-count in every sum. Keep the larger
   # reading: a duplicate row usually means a partial write followed by a full
   # one, so the maximum is the complete day.
-  key <- paste(d$sensor, d$date)
-  dup_key <- unique(key[duplicated(key)])
+  key <- paste(d$sensor, d$date, sep = "\r")
+  dup_key <- if (anyDuplicated(key)) unique(key[duplicated(key)]) else character(0)
   if (length(dup_key)) {
     # Log one entry per affected sensor-day, not per row, so the ledger count
     # matches the number of days corrected.
@@ -230,14 +270,12 @@ clean_counts <- function(daily, outages = NULL, meta = NULL) {
   if (!is.null(outages) && nrow(outages)) {
     oa <- outages
     oa$sensor <- tidy_sensor_name(oa$sensor_raw)
-    oa$is_out <- oa$n_intervals > 0 & (oa$n_oos / oa$n_intervals) >= OUTAGE_FRACTION
-    oa <- oa[oa$is_out, c("sensor", "date")]
-    oa <- oa[!duplicated(oa), ]
-    if (nrow(oa)) {
-      oa$.out <- TRUE
-      d <- merge(d, oa, by = c("sensor", "date"), all.x = TRUE)
-      d$outage <- !is.na(d$.out)
-      d$.out <- NULL
+    is_out <- oa$n_intervals > 0 & (oa$n_oos / oa$n_intervals) >= OUTAGE_FRACTION
+    # Composite-key membership instead of a two-column merge. The merge sorted
+    # both 112k-row frames to answer a yes/no question.
+    if (any(is_out)) {
+      out_key <- paste(oa$sensor[is_out], oa$date[is_out], sep = "\r")
+      d$outage <- paste(d$sensor, d$date, sep = "\r") %in% out_key
     }
   }
   hit <- which(d$outage & (!is.na(d$cyc) | !is.na(d$ped)))

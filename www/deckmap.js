@@ -128,10 +128,44 @@
       });
     }
 
+    /* Basemap style, declared inline over raster tiles.
+     *
+     * We used to point at CARTO's hosted dark-matter vector style. Its tiles
+     * fetch fine from a plain client, but CARTO gates the vector basemaps by
+     * referrer, so from a real page on a domain they don't know the map is
+     * replaced by a "get an API key from carto.com" notice.
+     *
+     * CARTO's *raster* tiles carry no such restriction -- they're the same
+     * ones Leaflet's CartoDB.DarkMatter provider uses on the Map tab. Going
+     * inline also drops three round trips (style.json, sprite, glyphs) from
+     * first paint, which is worth having on its own. */
+    _style() {
+      return {
+        version: 8,
+        sources: {
+          base: {
+            type: "raster",
+            tiles: ["a", "b", "c", "d"].map(
+              (s) => `https://${s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png`
+            ),
+            tileSize: 256,
+            maxzoom: 20,
+            attribution:
+              '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> · © <a href="https://carto.com/attributions">CARTO</a>',
+          },
+        },
+        layers: [
+          // A flat backdrop so the canvas is never white while tiles load.
+          { id: "bg", type: "background", paint: { "background-color": "#10141c" } },
+          { id: "base", type: "raster", source: "base" },
+        ],
+      };
+    }
+
     _initMap() {
       this.map = new maplibregl.Map({
         container: this.dom.canvas,
-        style: "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
+        style: this._style(),
         center: [-113.4938, 53.5461],
         zoom: 11.2,
         pitch: 45,

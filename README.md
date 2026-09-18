@@ -9,8 +9,28 @@ starts, and re-pulled whenever you press **Refresh**.
 Rscript -e 'shiny::runApp(".", port = 8080)'
 ```
 
-First run takes about 30 seconds — it fetches roughly 220,000 rows and builds
-the route network for the animation. After that, startup is around 3 seconds.
+Cold start is about 6 seconds, warm about 1.
+
+## How it starts quickly
+
+Most of the counter series is settled history: of 112,000 sensor-days, only the
+last few change. So the app ships a baseline under `data/` and asks the portal
+only for rows newer than it. A cold start fetches a few hundred rows instead of
+112,000, which took the fetch from 64 seconds to under 2.
+
+Pressing **Refresh** always pulls the full history instead. That is the escape
+hatch for the one thing incremental loading cannot see — the city occasionally
+revises history rather than only appending to it, and it corrected a
+malfunctioning counter's 2022 readings that way.
+
+Rebuild the baselines with:
+
+```
+Rscript scripts/build_deploy_data.R
+```
+
+Run it before redeploying after the city publishes new route geometry, and
+every few months to stop the baseline drifting from corrected history.
 
 ## What's in it
 
@@ -53,16 +73,24 @@ of 48 active counters still sit somewhere they can generate 2 km of path.
 | Purpose | Dataset | ID |
 |---|---|---|
 | Route geometry | Bike Routes | `vd4b-a4iv` |
-| Daily counts | Daily Pedestrian and Bike Counts | `sw7k-ptx8` |
-| 15-minute directional counts | Bike and Pedestrian Counts (Eco Counter) | `tq23-qn4m` |
+| Counts, positions and outages | Bike and Pedestrian Counts (Eco Counter) | `tq23-qn4m` |
 | Construction affecting bikes | On-street Construction and Maintenance | `7wiq-4rgy` |
 | Road closures | Traffic Disruptions | `k4tx-5k8p` |
 | Counter hardware and photos | Bike Counter Locations (Eco Counter) | `py7x-4d39` |
 
-`tq23-qn4m` is the important one and is easy to miss: 10.4 million rows at
-15-minute resolution with per-direction counts *and* the city's own
-`out_of_service` flag. It is queried with server-side `GROUP BY`, so the app
-never downloads the bulk of it.
+`tq23-qn4m` does nearly all the work: 10.4 million rows at 15-minute
+resolution with per-direction counts *and* the city's own `out_of_service`
+flag. Everything the daily view needs — counts, positions, outage flags — comes
+from one server-side `GROUP BY` against it, so the app never downloads the bulk.
+
+The app used to take daily counts from the obvious source, "Daily Pedestrian
+and Bike Counts" (`sw7k-ptx8`), and that turned out to be a mistake on two
+counts. It is slow out of all proportion to its size — a bare
+`select max(log_timstamp)` over 112k rows takes ten seconds, and any filtered
+read is a full scan — while the same rollup from the 10.4M-row table returns in
+under two. And it is *dirtier*: being a derived table it carries 14 duplicated
+sensor-days that its own source does not. The two agree exactly otherwise
+(5,352 overlapping sensor-days compared, zero mismatches).
 
 Two datasets that look right but aren't: `mmza-a4ee` ("Non-TDN Bike Route
 Disruptions") has two rows and stopped updating in 2021, and `pwsx-cf7d`

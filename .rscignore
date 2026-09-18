@@ -1,0 +1,21 @@
+# Files excluded from the deployment bundle (rsconnect).
+#
+# Keeping notes/ and tests/ out matters for more than size: renv scans the
+# whole directory for dependencies, and notes/eda.R would drag dplyr and
+# ggplot2 into the deployment despite the app never using them.
+
+notes
+tests
+scripts
+cache
+rsconnect
+
+# Superseded by the compressed seeds in data/ (1.4 MB against 13.4 MB).
+Bike_Routes_20251013.csv
+Daily_Pedestrian_and_Bike_Counts_20251102.csv
+
+.Rhistory
+.Rproj.user
+.DS_Store
+yegbike.Rproj
+README.md

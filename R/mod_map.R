@@ -21,7 +21,12 @@ CLASS_COLOURS <- c(
 
 map_ui <- function(id) {
   ns <- NS(id)
-  div(class = "page page-flush",
+  # as_fill_carrier marks this wrapper as both a fill item and a fill
+  # container. Without it the div is opaque to bslib's fill chain, the sidebar
+  # layout inside gets no height, and the map's height:100% resolves against an
+  # auto-height parent -- collapsing the map to zero pixels. The Simulation tab
+  # has the same structure but survives on the widget's own min-height.
+  bslib::as_fill_carrier(div(class = "page page-flush",
     layout_sidebar(
       fillable = TRUE,
       sidebar = sidebar(
@@ -40,7 +45,7 @@ map_ui <- function(id) {
       ),
       withSpinner(leafletOutput(ns("map"), height = "100%"), type = 8, color = PAL$cat[1])
     )
-  )
+  ))
 }
 
 map_server <- function(id, bundle, clean_mode) {
@@ -61,16 +66,24 @@ map_server <- function(id, bundle, clean_mode) {
     }, ignoreInit = TRUE)
 
     shown_routes <- reactive({
-      b <- req(bundle()); req(b$routes)
+      b <- req(bundle()); req(b$map_routes)
       cls <- input$classes
-      if (is.null(cls) || !length(cls)) return(b$routes[0, ])
-      b$routes[b$routes$classification %in% cls, ]
+      if (is.null(cls) || !length(cls)) return(b$map_routes[0, ])
+      b$map_routes[b$map_routes$classification %in% cls, ]
+    })
+
+    # Length per classification, computed once from full-resolution geometry.
+    # Doing it per filter change re-projected 9,860 features on every click,
+    # and simplified geometry would under-report the total besides.
+    class_km <- reactive({
+      b <- req(bundle())
+      rl <- route_lengths(b$routes)
+      stats::setNames(rl$km, rl$classification)
     })
 
     output$summary <- renderUI({
-      b <- req(bundle())
       r <- shown_routes()
-      km <- if (nrow(r)) sum(as.numeric(sf::st_length(sf::st_transform(r, 3402)))) / 1000 else 0
+      km <- sum(class_km()[intersect(names(class_km()), unique(r$classification))], na.rm = TRUE)
       tagList(
         div(class = "sidebar-stat",
             span(class = "sidebar-stat-value", sprintf("%s km", fmt_int(km))),
@@ -99,22 +112,30 @@ map_server <- function(id, bundle, clean_mode) {
       m <- leafletProxy("map") |> clearGroup("routes") |> removeControl("legend")
       if (!nrow(r)) return(m)
 
-      labels <- sprintf(
-        "<strong>%s</strong><br/>%s<br/><span style='color:#6b7280'>%s</span>",
-        ifelse(is.na(r$street_name_full) | r$street_name_full == "",
-               r$classification, r$street_name_full),
-        r$classification,
-        ifelse(is.na(r$construction_year), r$type,
-               paste0(r$type, " · built ", r$construction_year))
-      ) |> lapply(HTML)
+      # Plain-text labels rather than HTML. lapply(HTML) built one htmltools
+      # object per feature -- 9,860 of them on a full render, which dominated
+      # the server side of drawing this layer. Leaflet takes a character
+      # vector directly.
+      street <- ifelse(is.na(r$street_name_full) | r$street_name_full == "",
+                       r$classification, r$street_name_full)
+      labels <- ifelse(is.na(r$construction_year),
+                       sprintf("%s — %s", street, r$classification),
+                       sprintf("%s — %s (built %s)", street, r$classification,
+                               r$construction_year))
+      noncyc <- r$classification %in% NON_CYCLING_CLASS
 
       m |>
         addPolylines(
           data = r, group = "routes",
           color = unname(CLASS_COLOURS[r$classification]),
-          weight = ifelse(r$classification %in% NON_CYCLING_CLASS, 1.4, 2.4),
-          opacity = ifelse(r$classification %in% NON_CYCLING_CLASS, 0.5, 0.9),
+          weight = ifelse(noncyc, 1.4, 2.4),
+          opacity = ifelse(noncyc, 0.5, 0.9),
           label = labels,
+          # smoothFactor tells Leaflet how aggressively to simplify per zoom;
+          # the default of 1 leaves a lot of on-screen work for a network this
+          # dense. Combined with the pre-simplified geometry this is what makes
+          # the layer usable with every class switched on.
+          smoothFactor = 2,
           highlightOptions = highlightOptions(weight = 6, color = "#0b0b0b",
                                               opacity = 1, bringToFront = TRUE)
         ) |>
@@ -154,28 +175,34 @@ map_server <- function(id, bundle, clean_mode) {
       cs <- active_construction(b$construction)
       if (is.null(cs) || !nrow(cs)) return(m)
 
-      # Draw the affected extent where the permit carries geometry; fall back to
-      # a point marker where it does not.
-      for (i in seq_len(nrow(cs))) {
-        rings <- cs$rings[[i]]
-        if (!length(rings)) next
-        lab <- HTML(sprintf(
-          "<strong>%s</strong><br/>%s<br/><span style='color:#6b7280'>Until %s</span>",
-          cs$street[i], tools::toTitleCase(tolower(cs$reason[i])),
-          format(cs$finish_date[i], "%d %b %Y")))
-        for (rg in rings) {
-          m <- addPolylines(m, lng = rg[, 1], lat = rg[, 2], group = "construction",
-                            color = PAL$status[["critical"]], weight = 5,
-                            opacity = 0.75, label = lab)
-        }
+      # Draw the affected extents in ONE call. The previous version looped over
+      # permits and then over each permit's rings, issuing a separate
+      # addPolylines per ring -- about 1,500 round trips through the widget for
+      # a layer that is a single multi-line geometry. Assemble it as sf and
+      # hand Leaflet the lot.
+      has_geom <- which(lengths(cs$rings) > 0)
+      if (length(has_geom)) {
+        geoms <- lapply(cs$rings[has_geom], function(rings) {
+          sf::st_multilinestring(lapply(rings, function(m) m[, 1:2, drop = FALSE]))
+        })
+        ext <- sf::st_sf(
+          label = sprintf("%s — %s (until %s)",
+                          cs$street[has_geom],
+                          tools::toTitleCase(tolower(cs$reason[has_geom])),
+                          format(cs$finish_date[has_geom], "%d %b %Y")),
+          geometry = sf::st_sfc(geoms, crs = 4326)
+        )
+        m <- addPolylines(m, data = ext, group = "construction",
+                          color = PAL$status[["critical"]], weight = 5,
+                          opacity = 0.75, label = ~label, smoothFactor = 2)
       }
       pts <- cs[lengths(cs$rings) == 0 & is.finite(cs$lat), ]
       if (nrow(pts)) {
         m <- addCircleMarkers(
           m, data = pts, lng = ~lon, lat = ~lat, group = "construction",
           radius = 5, color = PAL$status[["critical"]], fillOpacity = 0.8, weight = 1,
-          label = lapply(sprintf("<strong>%s</strong><br/>%s", pts$street,
-                                 tools::toTitleCase(tolower(pts$reason))), HTML))
+          label = sprintf("%s — %s", pts$street,
+                          tools::toTitleCase(tolower(pts$reason))))
       }
       m
     })

@@ -9,7 +9,10 @@
 
 simulation_ui <- function(id) {
   ns <- NS(id)
-  div(class = "page page-flush",
+  # See the note in mod_map.R: a plain div breaks bslib's fill chain and
+  # collapses the map inside it. This tab only escaped that because the
+  # deck.gl widget carries its own min-height; don't rely on that.
+  bslib::as_fill_carrier(div(class = "page page-flush",
     layout_sidebar(
       fillable = TRUE,
       sidebar = sidebar(
@@ -34,7 +37,7 @@ simulation_ui <- function(id) {
       div(class = "sim-wrap",
         withSpinner(deckmapOutput(ns("deck"), height = "100%"), type = 8, color = PAL$cat[1]))
     )
-  )
+  ))
 }
 
 simulation_server <- function(id, bundle) {

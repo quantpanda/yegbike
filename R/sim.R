@@ -151,10 +151,19 @@ build_simulated <- function(intraday, path_cache, seed = 1) {
   )
 }
 
-#' Load the precomputed path library, or NULL with a reason if unavailable.
-load_path_cache <- function(path = "cache/paths.rds") {
-  if (!file.exists(path)) return(NULL)
-  tryCatch(readRDS(path), error = function(e) NULL)
+#' Load the precomputed path library, or NULL if there isn't one.
+#'
+#' Looks in `data/` first: that is a deploy artifact shipped with the app, so a
+#' hosted instance starts with the route network already built instead of
+#' spending ten seconds rebuilding it on every cold start. `cache/` is the
+#' local development fallback, written by scripts/build_paths.R.
+load_path_cache <- function(paths = c("data/paths.rds", cache_path("paths"))) {
+  for (p in paths) {
+    if (is.na(p) || !file.exists(p)) next
+    obj <- tryCatch(readRDS(p), error = function(e) NULL)
+    if (!is.null(obj)) return(obj)
+  }
+  NULL
 }
 
 #' Everything the Simulation tab needs for one date.

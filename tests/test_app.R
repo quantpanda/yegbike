@@ -84,6 +84,29 @@ testServer(simulation_server, args = list(bundle = bundle), {
   })
 })
 
+cat("\n-- UI structure --\n")
+# testServer proves a renderer runs; it says nothing about whether the result
+# is visible. The Map tab rendered fine and showed nothing, because its
+# wrapper div was opaque to bslib's fill chain and the map's height:100%
+# resolved to zero. These check the layout contract instead of the reactive.
+html_of <- function(x) paste(as.character(x), collapse = "")
+
+for (tab in list(list("Map", map_ui("m")), list("Simulation", simulation_ui("s")))) {
+  h <- html_of(tab[[2]])
+  ok(sprintf("%s: full-bleed wrapper is a fill container", tab[[1]]),
+     stopifnot(grepl("page-flush[^\"]*html-fill-container", h) ||
+               grepl("html-fill-container[^\"]*page-flush", h)))
+}
+ok("map output requests a height", grepl("id=\"m-map\"[^>]*height:", html_of(map_ui("m"))))
+
+css <- paste(readLines("www/app.css", warn = FALSE), collapse = "\n")
+ok("full-bleed pages have a chain-independent height",
+   stopifnot(grepl("\\.page-flush\\s*\\{[^}]*height:\\s*calc\\(100vh", css)))
+ok("full-bleed pages have a min-height floor",
+   stopifnot(grepl("\\.page-flush\\s*\\{[^}]*min-height", css)))
+ok("spinner wrapper passes height through",
+   stopifnot(grepl("\\.page-flush\\s+\\.shiny-spinner-output-container\\s*\\{[^}]*height", css)))
+
 cat("\n-- busiest day selection --\n")
 bd <- busiest_day(B$counts)
 ok("returns the global maximum by total riders", {
@@ -157,10 +180,17 @@ clean_off <- reactive(FALSE)
 testServer(trends_server, args = list(bundle = bundle, clean_mode = clean_off), {
   session$setInputs(norm = "mean", measure = "cyc")
   ok("renders with cleaning disabled", output$series)
-  ok("raw series peaks higher than cleaned", {
+  # A ">=" rather than a multiple: cleaning can only remove, so the raw peak is
+  # never lower -- but how much higher depends on what the city has corrected
+  # upstream, which changes without notice. An exact ratio here broke once the
+  # MacKinnon Ravine malfunction was fixed at source.
+  ok("raw series never peaks below cleaned", {
     raw   <- daily_series(counts_view(B$counts, FALSE), "cyc", "mean")
     clean <- daily_series(counts_view(B$counts, TRUE),  "cyc", "mean")
-    stopifnot(max(raw$value) > max(clean$value) * 1.5)
+    stopifnot(max(raw$value) >= max(clean$value))
+  })
+  ok("the toggle actually changes something", {
+    stopifnot(!identical(counts_view(B$counts, FALSE)$cyc, counts_view(B$counts, TRUE)$cyc))
   })
 })
 

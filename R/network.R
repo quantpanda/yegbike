@@ -17,6 +17,26 @@
 # this dataset shows as "the bike network" is sidewalk.
 NON_CYCLING_CLASS <- c("Walkway / Breezeway", "Maintenance Access")
 
+# Douglas-Peucker tolerance, in metres, for route geometry sent to the Map tab.
+# At 2 m the cycling network drops from 86,401 vertices to 28,535 and its WKT
+# payload from 1.8 MB to 0.6 MB, with no visible difference at city zoom --
+# 2 m is well under a pixel until you are zoomed past street level.
+MAP_SIMPLIFY_M <- 2
+
+#' Reduce route geometry to what a browser can draw smoothly.
+#'
+#' Projects to Alberta 10-TM (EPSG:3402) so the tolerance is in real metres,
+#' simplifies, and returns to WGS84 for Leaflet.
+simplify_routes <- function(routes, tol_m = MAP_SIMPLIFY_M) {
+  if (is.null(routes) || !nrow(routes)) return(routes)
+  out <- tryCatch({
+    g <- sf::st_simplify(sf::st_transform(sf::st_geometry(routes), 3402), dTolerance = tol_m)
+    sf::st_geometry(routes) <- sf::st_transform(g, 4326)
+    routes
+  }, error = function(e) routes)
+  out
+}
+
 # Spacing, in metres, used to both densify and snap the network.
 #
 # The route dataset is a collection of independent line features, not a noded
@@ -290,7 +310,7 @@ build_counter_paths <- function(bg, counters, n_paths = 24, target_m = 3000, see
 #' is precomputed rather than rebuilt per request. Takes about ten seconds.
 #'
 #' @param log function(msg) for progress, or NULL
-build_path_cache <- function(routes, counters, path = "cache/paths.rds", log = NULL) {
+build_path_cache <- function(routes, counters, path = path_cache_file(), log = NULL) {
   say <- function(...) if (is.function(log)) log(sprintf(...))
 
   bg <- build_graph(routes)
@@ -304,10 +324,12 @@ build_path_cache <- function(routes, counters, path = "cache/paths.rds", log = N
 
   out <- list(paths = paths, counters = counters, built_at = Sys.time(),
               component_share = rep$largest_share, grid_m = bg$grid_m)
-  dir.create(dirname(path), showWarnings = FALSE, recursive = TRUE)
-  saveRDS(out, path)
+  cache_write(out, path)
   out
 }
+
+#' Where a freshly built path library is written.
+path_cache_file <- function() cache_path("paths")
 
 #' Counters that have reported recently, with a representative position.
 recent_counters <- function(counts, days = 90) {
