@@ -10,7 +10,7 @@
 # Rules:
 #   R1 renamed sensor      merge labels that share coordinates
 #   R2 duplicate rows      collapse duplicate (sensor, date)
-#   R3 sensor outage       use the city's own out_of_service flag; 0 -> NA
+#   R3 sensor outage       use the city's own 'Out of Service' flag; -> NA
 #   R4 cross-modal         one mode implausibly dwarfs the other
 #   R5 robust spike        per-sensor, per-month MAD outlier
 #   R6 missing             blank counts

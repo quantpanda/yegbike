@@ -2,8 +2,9 @@
 
 A Shiny app for keeping up with Edmonton's bike lanes: what's open, what's
 closed, how busy it is, and how that has changed. Data is pulled from the
-[City of Edmonton open data portal](https://data.edmonton.ca) when the app
-starts, and re-pulled whenever you press **Refresh**.
+[City of Edmonton open data portal](https://data.edmonton.ca) once per server
+process and shared by every visitor; the first visit after it is an hour old
+triggers an incremental reload.
 
 ```
 Rscript -e 'shiny::runApp(".", port = 8080)'
@@ -18,10 +19,24 @@ last few change. So the app ships a baseline under `data/` and asks the portal
 only for rows newer than it. A cold start fetches a few hundred rows instead of
 112,000, which took the fetch from 64 seconds to under 2.
 
-Pressing **Refresh** always pulls the full history instead. That is the escape
-hatch for the one thing incremental loading cannot see — the city occasionally
-revises history rather than only appending to it, and it corrected a
-malfunctioning counter's 2022 readings that way.
+Incremental loading cannot see one thing: the city occasionally revises
+history rather than only appending to it (it corrected a malfunctioning
+counter's 2022 readings that way). Re-run `scripts/build_deploy_data.R` and
+redeploy every few months to pick those revisions up.
+
+## Built for a small server
+
+The app runs on a small shinyapps.io instance, so:
+
+- **Data loads once per process**, not once per visitor (`shared_bundle()` in
+  `R/data.R`). Previously each session spent ~16 s fetching and cleaning and
+  held its own 36 MB copy.
+- **The map draws one merged shape per route type**, built at deploy time:
+  11 features and 0.8 MB instead of 9,860 segments and 5.4 MB. Construction
+  outlines are simplified the same way (2.5 MB to 0.4 MB). Sidebar controls
+  only show and hide layers, so a click sends about 1 KB.
+- **The basemap is Esri's World Gray Canvas**, which needs no API key. CARTO's
+  basemaps now serve an "API KEY REQUIRED" image for every tile.
 
 Rebuild the baselines with:
 
@@ -37,36 +52,9 @@ every few months to stop the baseline drifting from corrected history.
 | Tab | What it answers |
 |---|---|
 | **Overview** | How many people rode yesterday, how the year compares to last, what's under construction |
-| **Map** | Where the routes are, how busy each counter is, which bike facilities are disrupted right now |
-| **Simulation** | A day of city-wide cycling, animated over a 24-hour clock |
-| **Trends** | Daily, seasonal and year-over-year volumes; when in the week people ride; winter cycling |
-| **Counters** | Per-counter history, typical day, and how complete each record actually is |
-| **Network** | Kilometres by route type and the build-out over time |
-| **Data quality** | Every correction the app makes, and the data without them |
-
-## The simulation
-
-Two modes behind one toggle, because they are epistemically different things:
-
-- **Measured** — each counter pulses with its own 15-minute reading. Nothing
-  is inferred.
-- **Simulated** — the same counts rendered as movement. A rider is spawned for
-  every few cyclists recorded and sent along real bike-route geometry in the
-  direction the counter registered.
-
-The volumes, timing and direction in simulated mode are real. **The route any
-individual rider takes is invented** — a counter records a crossing, not a
-journey. The UI says so on screen rather than in a footnote.
-
-Paths come from a routable graph built from the city's route geometry. That
-geometry is not topologically noded: only 3% of segment endpoints have another
-endpoint within a metre, and where segments do meet, 40% of the time an
-endpoint lands mid-way along another segment. Snapping endpoints together
-therefore yields a graph in 3,501 fragments whose largest component holds 1% of
-the network. Instead every line is densified and snapped to a 20 m grid, which
-closes T-junctions and lifts the largest component to 24%. The residual
-fragmentation is real — Edmonton has many disconnected trail systems — but 47
-of 48 active counters still sit somewhere they can generate 2 km of path.
+| **Map** | Where the routes are, how busy each counter is, which bike facilities are under construction right now |
+| **Trends** | Daily, seasonal and year-over-year volumes; when in the week people ride; winter cycling; then per-counter history and typical day |
+| **About** | Kilometres by route type, the build-out over time, and the data quality rules with a before/after chart |
 
 ## Data sources
 
@@ -116,9 +104,8 @@ live.
 
 ## Data quality
 
-The counter data has real defects. Corrections are applied by default, listed
-individually on the **Data quality** tab, and can be switched off entirely with
-the **Cleaned data** toggle in the header.
+The counter data has real defects. Corrections are always applied; the rules
+and a raw-versus-cleaned chart are on the **About** tab.
 
 | Rule | What it catches | Effect |
 |---|---|---|
@@ -172,15 +159,10 @@ app.R                  UI shell and server assembly
 global.R               libraries and sourcing
 R/socrata.R            paged, cached, retrying portal access
 R/clean.R              data quality rules R1–R9
-R/network.R            routable graph and agent paths
-R/sim.R                counts to animation payloads
 R/theme.R              palette and shared plot theme
-R/data.R               the app-wide data bundle
-R/deckmap_widget.R     Shiny binding for the animation
-R/mod_*.R              one module per tab
-www/deckmap.js         deck.gl + MapLibre widget
-www/vendor/            pinned deck.gl 9.1.14, maplibre-gl 4.7.1
-scripts/build_paths.R  force a route-network rebuild
+R/data.R               the shared data bundle and derived views
+R/mod_*.R              one module per tab section
+scripts/build_deploy_data.R  baselines and map geometry shipped in data/
 tests/                 see below
 notes/eda.R            the original exploratory analysis, kept for reference
 cache/                 generated; safe to delete

@@ -15,15 +15,30 @@ ok <- function(label, expr) {
 }
 
 cat("loading data bundle...\n")
-B <- app_data(force = FALSE)
+B <- shared_bundle()
 bundle <- reactiveVal(B)
-clean_on <- reactive(TRUE)
 cat(sprintf("  %d routes, %d counter-days, %d ledger rows\n\n",
             nrow(B$routes), nrow(B$counts), nrow(B$ledger)))
 
+cat("-- Shared bundle --\n")
+ok("second session reuses the loaded bundle", {
+  t <- system.time(b2 <- shared_bundle())[["elapsed"]]
+  stopifnot(identical(b2, B), t < 0.5)
+})
+ok("bundle carries no route geometry", stopifnot(!inherits(B$routes, "sf")))
+ok("map geometry is one feature per route type",
+   stopifnot(nrow(B$map_routes) == length(unique(B$routes$classification))))
+ok("map geometry is small", {
+  f <- tempfile(fileext = ".geojson"); sf::st_write(B$map_routes, f, quiet = TRUE)
+  stopifnot(file.size(f) < 1.5e6)
+})
+ok("no simulation or disruption data loaded",
+   stopifnot(is.null(B$paths), is.null(B$disruptions)))
+cat("\n")
+
 # ---------------------------------------------------------------------------
 cat("-- Overview --\n")
-testServer(overview_server, args = list(bundle = bundle, clean_mode = clean_on), {
+testServer(overview_server, args = list(bundle = bundle), {
   ok("tiles",   output$tiles)
   ok("recent",  output$recent)
   ok("top",     output$top)
@@ -32,56 +47,21 @@ testServer(overview_server, args = list(bundle = bundle, clean_mode = clean_on),
 })
 
 cat("\n-- Map --\n")
-testServer(map_server, args = list(bundle = bundle, clean_mode = clean_on), {
-  session$setInputs(cycling_only = TRUE, show_counters = TRUE,
-                    show_construction = TRUE, show_disruptions = TRUE,
+testServer(map_server, args = list(bundle = bundle), {
+  session$setInputs(show_counters = TRUE, show_construction = TRUE,
                     classes = setdiff(names(CLASS_COLOURS), NON_CYCLING_CLASS))
-  ok("leaflet base", output$map)
+  ok("leaflet renders", output$map)
   ok("sidebar summary", output$summary)
-  ok("shown_routes non-empty", stopifnot(nrow(shown_routes()) > 1000))
-  session$setInputs(cycling_only = FALSE, classes = names(CLASS_COLOURS))
-  ok("all classes render", output$summary)
-})
-
-cat("\n-- Simulation --\n")
-testServer(simulation_server, args = list(bundle = bundle), {
-  session$setInputs(day = max(B$counts$date, na.rm = TRUE))
-  ok("payload builds", {
-    p <- payload()
-    stopifnot(p$n_rows > 0, length(p$measured$counters) > 10)
+  ok("uses a keyless basemap", {
+    stopifnot(grepl("Esri", MAP_TILES), !grepl("CartoDB|Stadia|Thunderforest|Mapbox", MAP_TILES))
   })
-  ok("measured payload shape", {
-    p <- payload()
-    stopifnot(all(vapply(p$measured$counters, function(c) length(c$cyc) == 96, logical(1))))
+  ok("toggling layers does not re-render the map", {
+    before <- output$map
+    session$setInputs(classes = names(CLASS_COLOURS), show_counters = FALSE)
+    stopifnot(identical(before, output$map))
   })
-  ok("simulated agents exist", {
-    p <- payload()
-    stopifnot(p$simulated$shown > 100, length(p$simulated$paths) > 10)
-  })
-  ok("agents reference valid paths", {
-    p <- payload()
-    stopifnot(min(p$simulated$agents$p) >= 0,
-              max(p$simulated$agents$p) < length(p$simulated$paths))
-  })
-  ok("agent times inside the day", {
-    p <- payload()
-    stopifnot(min(p$simulated$agents$t) >= 0, max(p$simulated$agents$t) <= 1440)
-  })
-  ok("deck output", output$deck)
-  ok("day stats", output$daystats)
-
-  # The button itself can only be checked for not erroring: updateDateInput has
-  # no client to round-trip through under testServer, so input$day never
-  # changes here. The selection logic is tested directly below instead.
-  session$setInputs(busiest = 1)
-  ok("busiest-day button runs", TRUE)
-
-  # Animate the actual busiest day and confirm it is worth animating.
-  session$setInputs(day = busiest_day(B$counts)$date)
-  ok("busiest day animates with a full agent set", {
-    p <- payload()
-    stopifnot(p$n_rows > 0, p$simulated$shown > 1000, p$simulated$total > 10000)
-  })
+  session$setInputs(classes = character(0))
+  ok("no classes selected still renders", output$summary)
 })
 
 cat("\n-- UI structure --\n")
@@ -91,7 +71,7 @@ cat("\n-- UI structure --\n")
 # resolved to zero. These check the layout contract instead of the reactive.
 html_of <- function(x) paste(as.character(x), collapse = "")
 
-for (tab in list(list("Map", map_ui("m")), list("Simulation", simulation_ui("s")))) {
+for (tab in list(list("Map", map_ui("m")))) {
   h <- html_of(tab[[2]])
   ok(sprintf("%s: full-bleed wrapper is a fill container", tab[[1]]),
      stopifnot(grepl("page-flush[^\"]*html-fill-container", h) ||
@@ -107,27 +87,8 @@ ok("full-bleed pages have a min-height floor",
 ok("spinner wrapper passes height through",
    stopifnot(grepl("\\.page-flush\\s+\\.shiny-spinner-output-container\\s*\\{[^}]*height", css)))
 
-cat("\n-- busiest day selection --\n")
-bd <- busiest_day(B$counts)
-ok("returns the global maximum by total riders", {
-  s <- daily_series(B$counts, "cyc", "total")
-  stopifnot(bd$date == s$date[which.max(s$value)], bd$total == max(s$value))
-})
-ok("busiest day has near-full counter coverage", {
-  n <- length(unique(B$counts$sensor[B$counts$date == bd$date & !is.na(B$counts$cyc)]))
-  stopifnot(n >= 40)
-})
-# The regression this replaces: the per-counter mean picked a five-counter day.
-ok("beats the per-counter mean, which picks a near-empty day", {
-  m <- daily_series(B$counts, "cyc", "mean")
-  mean_pick <- m$n_sensors[which.max(m$value)]
-  stopifnot(mean_pick < 10, bd$n_sensors > 4 * mean_pick)
-})
-cat(sprintf("  ..   busiest: %s, %s riders, %d counters\n",
-            format(bd$date, "%a %d %b %Y"), fmt_int(bd$total), bd$n_sensors))
-
 cat("\n-- Trends --\n")
-testServer(trends_server, args = list(bundle = bundle, clean_mode = clean_on), {
+testServer(trends_server, args = list(bundle = bundle), {
   for (n in c("mean", "panel", "total")) {
     session$setInputs(norm = n, measure = "cyc")
     ok(paste("series /", n), output$series)
@@ -142,7 +103,7 @@ testServer(trends_server, args = list(bundle = bundle, clean_mode = clean_on), {
 })
 
 cat("\n-- Counters --\n")
-testServer(counters_server, args = list(bundle = bundle, clean_mode = clean_on), {
+testServer(counters_server, args = list(bundle = bundle), {
   session$setInputs(active_only = TRUE)
   s1 <- choices()[1]
   session$setInputs(sensor = s1)
@@ -154,45 +115,30 @@ testServer(counters_server, args = list(bundle = bundle, clean_mode = clean_on),
   ok("includes decommissioned", stopifnot(length(choices()) > 48))
 })
 
-cat("\n-- Network --\n")
-testServer(network_server, args = list(bundle = bundle), {
+cat("\n-- About --\n")
+testServer(about_server, args = list(bundle = bundle), {
   ok("tiles",       output$tiles)
   ok("composition", output$composition)
   ok("buildout",    output$buildout)
-  ok("table",       output$table)
+  ok("rules",       output$rules)
+  ok("compare",     output$compare)
+})
+ok("raw series never peaks below cleaned", {
+  raw <- B$counts; raw$cyc <- raw$cyc_raw
+  stopifnot(max(daily_series(raw, "cyc", "mean")$value) >=
+            max(daily_series(B$counts, "cyc", "mean")$value))
 })
 
-cat("\n-- Data quality --\n")
-testServer(quality_server, args = list(bundle = bundle), {
-  session$setInputs(rule_filter = "")
-  ok("tiles",    output$tiles)
-  ok("rules",    output$rules)
-  ok("compare",  output$compare)
-  ok("bysensor", output$bysensor)
-  ok("ledger",   output$ledger)
-  ok("aliases",  output$aliases)
-  session$setInputs(rule_filter = "R5")
-  ok("ledger filtered to R5", stopifnot(all(filtered()$rule == "R5")))
+cat("\n-- App --\n")
+ui_html <- local({ source("app.R", local = TRUE); paste(as.character(ui), collapse = "") })
+ok("tabs are Overview, Map, Trends, About", {
+  tabs <- regmatches(ui_html, gregexpr('data-value="[^"]+"', ui_html))[[1]]
+  stopifnot(identical(unique(sub('data-value="([^"]+)"', "\\1", tabs)),
+                      c("Overview", "Map", "Trends", "About")))
 })
-
-cat("\n-- raw/cleaned toggle propagates --\n")
-clean_off <- reactive(FALSE)
-testServer(trends_server, args = list(bundle = bundle, clean_mode = clean_off), {
-  session$setInputs(norm = "mean", measure = "cyc")
-  ok("renders with cleaning disabled", output$series)
-  # A ">=" rather than a multiple: cleaning can only remove, so the raw peak is
-  # never lower -- but how much higher depends on what the city has corrected
-  # upstream, which changes without notice. An exact ratio here broke once the
-  # MacKinnon Ravine malfunction was fixed at source.
-  ok("raw series never peaks below cleaned", {
-    raw   <- daily_series(counts_view(B$counts, FALSE), "cyc", "mean")
-    clean <- daily_series(counts_view(B$counts, TRUE),  "cyc", "mean")
-    stopifnot(max(raw$value) >= max(clean$value))
-  })
-  ok("the toggle actually changes something", {
-    stopifnot(!identical(counts_view(B$counts, FALSE)$cyc, counts_view(B$counts, TRUE)$cyc))
-  })
-})
+ok("no deck.gl or MapLibre shipped", stopifnot(!grepl("deck.gl|maplibre", ui_html)))
+ok("no cleaned-data toggle or Refresh button",
+   stopifnot(!grepl("clean_mode|id=\"refresh\"", ui_html)))
 
 cat(sprintf("\n%d passed, %d failed\n", pass, fail))
 if (fail > 0) quit(status = 1)

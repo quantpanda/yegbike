@@ -6,6 +6,19 @@
 # whole app.
 # ---------------------------------------------------------------------------
 
+# Classifications that are not cycling infrastructure. "Walkway / Breezeway"
+# alone is 3,031 of the 9,766 features -- a third of what a naive render of
+# this dataset shows as "the bike network" is sidewalk.
+NON_CYCLING_CLASS <- c("Walkway / Breezeway", "Maintenance Access")
+
+# Douglas-Peucker tolerance, in metres, for the Map tab's route geometry. 5 m
+# is under a pixel at any zoom that fits a neighbourhood on screen.
+MAP_SIMPLIFY_M <- 5
+
+# How old the shared bundle may get before the next visitor triggers a reload.
+# A reload is incremental (only rows newer than the cache), so this is cheap.
+DATA_MAX_AGE_S <- 3600
+
 #' Load and clean every dataset the app uses.
 #'
 #' @param force  bypass the disk cache and re-fetch from data.edmonton.ca
@@ -16,12 +29,13 @@ app_data <- function(force = FALSE, notify = NULL) {
   step("Bike routes", 0.05)
   routes <- try_layer(load_routes(force))
 
-  # The Map tab gets its own simplified copy. Prefer the one built at deploy
-  # time; simplifying 9,860 features at startup costs a couple of seconds.
-  map_routes <- seed_rds("routes_simplified")
+  # The Map tab draws one merged shape per route type rather than 9,860
+  # segments: 5.4 MB of GeoJSON becomes under 1 MB, and Leaflet draws 11
+  # layers instead of 9,860. Prefer the copy built at deploy time.
+  map_routes <- seed_rds("routes_by_class")
   if (is.null(map_routes) && !is.null(routes)) {
     step("Preparing map geometry", 0.15)
-    map_routes <- try_layer(simplify_routes(routes), fallback = routes)
+    map_routes <- try_layer(merge_routes_by_class(routes))
   }
 
   # Counts and outage flags come from one rollup query, so they are fetched
@@ -35,39 +49,63 @@ app_data <- function(force = FALSE, notify = NULL) {
   step("Counter details", 0.65)
   meta <- try_layer(load_counter_meta(force), fallback = data.frame())
 
-  step("Construction", 0.75)
+  step("Construction", 0.80)
   construction <- try_layer(load_construction(force), fallback = data.frame())
-
-  step("Disruptions", 0.85)
-  disruptions <- try_layer(load_disruptions(force), fallback = data.frame())
 
   step("Applying data quality rules", 0.90)
   cleaned <- clean_counts(daily, outages, meta)
 
-  # The animation's route library is derived from geometry that changes a few
-  # times a year, so it is precomputed. Build it on first run rather than
-  # making the user remember a setup script; ten seconds once, then cached.
-  paths <- load_path_cache()
-  if (is.null(paths) && !is.null(routes) && nrow(routes)) {
-    step("Building the route network (first run only)", 0.94)
-    paths <- try_layer(build_path_cache(routes, recent_counters(cleaned$data)))
-  }
-
   step("Ready", 1)
   list(
-    routes       = routes,
-    map_routes   = map_routes %||% routes,
+    # Segment attributes only. Geometry is needed once, for lengths, and
+    # carrying it in a bundle every session shares would cost RAM for nothing.
+    routes       = route_table(routes),
+    map_routes   = map_routes,
     counts       = cleaned$data,
     ledger       = cleaned$ledger,
     qa_summary   = cleaned$summary,
     aliases      = cleaned$aliases,
     meta         = meta,
     construction = construction,
-    disruptions  = disruptions,
-    paths        = paths,
+    construction_map = try_layer(construction_map(construction)),
     fetched_at   = Sys.time(),
     fetch_log    = fetch_log()
   )
+}
+
+# ---------------------------------------------------------------------------
+# One bundle per R process, shared by every session.
+#
+# Loading used to happen inside server(), so every visitor paid for the full
+# fetch-and-clean (about 16 s) and held their own ~36 MB copy. Now the first
+# visitor after a cold start or after DATA_MAX_AGE_S pays for it once and
+# everyone else gets it instantly. R is single-threaded, so two sessions
+# cannot race to reload.
+# ---------------------------------------------------------------------------
+
+.shared <- new.env(parent = emptyenv())
+
+#' TRUE when the shared bundle exists and is younger than DATA_MAX_AGE_S.
+shared_bundle_fresh <- function() {
+  b <- .shared$bundle
+  !is.null(b) &&
+    as.numeric(difftime(Sys.time(), b$fetched_at, units = "secs")) < DATA_MAX_AGE_S
+}
+
+#' The shared bundle, reloading it first if stale.
+#'
+#' A failed reload keeps serving the previous bundle rather than taking the
+#' app down; only a failure with nothing to fall back on is an error.
+shared_bundle <- function(notify = NULL) {
+  if (!shared_bundle_fresh()) {
+    b <- tryCatch(app_data(force = FALSE, notify = notify), error = function(e) {
+      if (is.null(.shared$bundle)) stop(e)
+      warning("data reload failed, serving previous bundle: ", conditionMessage(e))
+      NULL
+    })
+    if (!is.null(b)) .shared$bundle <- b
+  }
+  .shared$bundle
 }
 
 #' Run a loader, downgrading a hard failure to a usable empty value.
@@ -111,22 +149,6 @@ sensor_summary <- function(counts, from = NULL, to = NULL) {
   agg[order(-agg$cyc_total), ]
 }
 
-#' The day with the most cyclists counted city-wide.
-#'
-#' A raw total, deliberately, unlike the per-counter mean the trend charts use.
-#' The mean is right for trends and wrong for "busiest": on 2021-05-30 only
-#' five counters reported, and 4,048 riders across five sensors averages higher
-#' than a full 48-counter day carrying four times the traffic -- which made the
-#' Simulation tab's "Busiest day" button open a near-empty map.
-#'
-#' @return list(date, total, n_sensors)
-busiest_day <- function(counts) {
-  s <- daily_series(counts, "cyc", "total")
-  if (!nrow(s)) return(NULL)
-  i <- which.max(s$value)
-  list(date = s$date[i], total = s$value[i], n_sensors = s$n_sensors[i])
-}
-
 #' Counters that have reported within `days` of the latest date in the data.
 #'
 #' Seven counters have been decommissioned over the years. Including them in a
@@ -146,15 +168,86 @@ active_construction <- function(construction, on_date = Sys.Date()) {
   construction[keep, ]
 }
 
-#' Total network length in km by classification.
+#' Segment attributes with a length in km, geometry dropped.
+route_table <- function(routes) {
+  if (is.null(routes) || !nrow(routes)) return(NULL)
+  km <- as.numeric(sf::st_length(sf::st_transform(routes, 3402))) / 1000
+  data.frame(
+    classification    = routes$classification,
+    construction_year = suppressWarnings(as.integer(routes$construction_year)),
+    km                = km,
+    stringsAsFactors  = FALSE
+  )
+}
+
+#' Map-ready construction layer for the permits open today.
+#'
+#' Built once per bundle. The permit outlines arrive at survey precision, and
+#' sent as-is they were 2.5 MB of the Map tab -- more than the whole route
+#' network. Simplified to MAP_SIMPLIFY_M and rounded like the routes.
+#'
+#' @return list(lines = sf or NULL, points = data.frame or NULL)
+construction_map <- function(construction, tol_m = MAP_SIMPLIFY_M) {
+  cs <- active_construction(construction)
+  if (is.null(cs) || !nrow(cs)) return(NULL)
+  reason <- tools::toTitleCase(tolower(ifelse(is.na(cs$reason), "", cs$reason)))
+
+  lines <- NULL
+  has_geom <- which(lengths(cs$rings) > 0)
+  if (length(has_geom)) {
+    geoms <- lapply(cs$rings[has_geom], function(rings) {
+      sf::st_multilinestring(lapply(rings, function(r) r[, 1:2, drop = FALSE]))
+    })
+    lines <- sf::st_sf(
+      label = sprintf("%s — %s (until %s)", cs$street[has_geom], reason[has_geom],
+                      format(cs$finish_date[has_geom], "%d %b %Y")),
+      geometry = sf::st_sfc(geoms, crs = 4326)
+    )
+    lines <- sf::st_transform(sf::st_simplify(sf::st_transform(lines, 3402),
+                                              dTolerance = tol_m), 4326)
+    lines <- lines[!sf::st_is_empty(lines), ]
+    sf::st_geometry(lines) <- sf::st_sfc(lapply(sf::st_geometry(lines), function(g) {
+      sf::st_multilinestring(lapply(unclass(sf::st_cast(g, "MULTILINESTRING")),
+                                    function(l) round(l, 5)))
+    }), crs = 4326)
+  }
+
+  pts <- cs[lengths(cs$rings) == 0 & is.finite(cs$lat), ]
+  points <- if (nrow(pts)) data.frame(
+    lon = pts$lon, lat = pts$lat,
+    label = sprintf("%s — %s", pts$street, reason[lengths(cs$rings) == 0 & is.finite(cs$lat)]),
+    stringsAsFactors = FALSE
+  )
+  list(lines = lines, points = points)
+}
+
+#' Total network length in km by classification, from route_table().
 route_lengths <- function(routes) {
   if (is.null(routes) || !nrow(routes)) return(data.frame())
-  len_m <- as.numeric(sf::st_length(sf::st_transform(routes, 3402)))
-  agg <- stats::aggregate(len_m, by = list(classification = routes$classification), FUN = sum)
-  names(agg)[2] <- "metres"
-  agg$km <- agg$metres / 1000
+  agg <- stats::aggregate(routes$km, by = list(classification = routes$classification), FUN = sum)
+  names(agg)[2] <- "km"
   agg$cycling <- !agg$classification %in% NON_CYCLING_CLASS
   agg[order(-agg$km), ]
+}
+
+#' One simplified MULTILINESTRING per classification, for the Map tab.
+#'
+#' Projects to Alberta 10-TM (EPSG:3402) so the tolerance is in real metres,
+#' and rounds coordinates to 5 decimals (about a metre) because Leaflet ships
+#' every digit it is given.
+merge_routes_by_class <- function(routes, tol_m = MAP_SIMPLIFY_M) {
+  r <- sf::st_transform(routes, 3402)
+  r <- sf::st_simplify(r, dTolerance = tol_m)
+  r <- sf::st_transform(r, 4326)
+  r <- suppressWarnings(sf::st_cast(sf::st_cast(r, "MULTILINESTRING"), "LINESTRING"))
+  r <- r[!sf::st_is_empty(r), ]
+  parts <- split(sf::st_geometry(r), r$classification)
+  geoms <- lapply(parts, function(g) {
+    sf::st_multilinestring(lapply(g, function(l) round(unclass(l), 5)))
+  })
+  sf::st_sf(classification = names(parts),
+            geometry = sf::st_sfc(geoms, crs = 4326),
+            stringsAsFactors = FALSE)
 }
 
 #' Day-of-week x hour-of-day mean cyclist volume from the 15-minute table.

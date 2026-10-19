@@ -15,13 +15,12 @@
 SOCRATA_HOST <- "https://data.edmonton.ca"
 
 # Dataset identifiers, with cache lifetimes chosen by how often each actually
-# changes. Route geometry moves a few times a year; disruptions move hourly.
+# changes. Route geometry moves a few times a year; construction permits move hourly.
 DATASETS <- list(
   routes      = list(id = "vd4b-a4iv", ttl = 7 * 24 * 3600, label = "Bike Routes"),
   daily       = list(id = "sw7k-ptx8", ttl = 6 * 3600,      label = "Daily Pedestrian and Bike Counts"),
   intraday    = list(id = "tq23-qn4m", ttl = 6 * 3600,      label = "Bike and Pedestrian Counts (Eco Counter)"),
   construction= list(id = "7wiq-4rgy", ttl = 1 * 3600,      label = "On-street Construction and Maintenance"),
-  disruptions = list(id = "k4tx-5k8p", ttl = 1 * 3600,      label = "Traffic Disruptions"),
   counters    = list(id = "py7x-4d39", ttl = 7 * 24 * 3600, label = "Bike Counter Locations (Eco Counter)")
 )
 
@@ -353,7 +352,11 @@ ROLLUP_SELECT <- paste(
   "max(latitude) AS lat",
   "max(longitude) AS lon",
   "count(*) AS n_intervals",
-  "sum(case(out_of_service IS NOT NULL, 1, true, 0)) AS n_oos",
+  # Only 'Out of Service' means the counter is dead. Since mid-2025 the city
+  # also writes 'Outage 1' on ~12 counters a day, and those intervals carry
+  # normal, even above-average, counts -- treating any non-null label as an
+  # outage blanked 30-40% of summer 2025.
+  "sum(case(out_of_service = 'Out of Service', 1, true, 0)) AS n_oos",
   sep = ", "
 )
 ROLLUP_GROUP <- "counter_location_description, date_trunc_ymd(log_timestamp)"
@@ -529,7 +532,11 @@ OUTAGE_SELECT <- paste(
   "counter_location_description",
   "date_trunc_ymd(log_timestamp) AS d",
   "count(*) AS n_intervals",
-  "sum(case(out_of_service IS NOT NULL, 1, true, 0)) AS n_oos",
+  # Only 'Out of Service' means the counter is dead. Since mid-2025 the city
+  # also writes 'Outage 1' on ~12 counters a day, and those intervals carry
+  # normal, even above-average, counts -- treating any non-null label as an
+  # outage blanked 30-40% of summer 2025.
+  "sum(case(out_of_service = 'Out of Service', 1, true, 0)) AS n_oos",
   sep = ", "
 )
 OUTAGE_GROUP <- "counter_location_description, date_trunc_ymd(log_timestamp)"
@@ -689,45 +696,6 @@ as_ring_list <- function(x) {
     })))
   }
   list()
-}
-
-#' Current traffic disruptions (road closures etc.), city-wide.
-load_disruptions <- function(force = FALSE) {
-  query <- function() {
-    soql_fetch(
-      DATASETS$disruptions$id,
-      select = paste(
-        "disruption_id", "start_date", "finish_date", "status", "on_street",
-        "from_street", "to_street", "impact", "details", "description",
-        "activity_type", "infrastructure", "point",
-        sep = ", "
-      ),
-      where = "status in ('Current', 'Emergency', 'Revised')"
-    ) |> normalise_disruptions()
-  }
-  cached_fetch("disruptions", force = force, query = query, seed = function() data.frame())
-}
-
-normalise_disruptions <- function(df) {
-  if (!nrow(df)) return(data.frame())
-  cc <- df[["point.coordinates"]]
-  lon <- vapply(cc, function(x) if (length(x) >= 2) as.numeric(x[[1]]) else NA_real_, numeric(1))
-  lat <- vapply(cc, function(x) if (length(x) >= 2) as.numeric(x[[2]]) else NA_real_, numeric(1))
-  data.frame(
-    id          = as.character(df$disruption_id),
-    start_date  = parse_ts(df$start_date),
-    finish_date = parse_ts(df$finish_date),
-    status      = as.character(df$status),
-    on_street   = as.character(df$on_street),
-    from_street = as.character(df$from_street),
-    to_street   = as.character(df$to_street),
-    impact      = as.character(df$impact),
-    details     = as.character(df$details),
-    activity    = as.character(df$activity_type),
-    infra       = as.character(df$infrastructure),
-    lat = lat, lon = lon,
-    stringsAsFactors = FALSE
-  )
 }
 
 #' Counter metadata: hardware configuration, orientation, and photos.

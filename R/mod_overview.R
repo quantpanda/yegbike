@@ -42,13 +42,10 @@ overview_ui <- function(id) {
   )
 }
 
-overview_server <- function(id, bundle, clean_mode, parent_session = NULL) {
+overview_server <- function(id, bundle) {
   moduleServer(id, function(input, output, session) {
 
-    counts <- reactive({
-      b <- req(bundle())
-      counts_view(b$counts, clean_mode())
-    })
+    counts <- reactive(req(bundle())$counts)
 
     output$tiles <- renderUI({
       b <- req(bundle()); d <- counts()

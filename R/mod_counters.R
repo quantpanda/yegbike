@@ -1,14 +1,14 @@
 # ---------------------------------------------------------------------------
-# Counters -- per-sensor detail, including how much of the record is actually
+# Counters -- the lower half of the Trends tab: per-sensor detail, including how much of the record is actually
 # there. Coverage matters: almost no counter has a complete series, and a gap
 # looks identical to a quiet day unless you show it.
 # ---------------------------------------------------------------------------
 
 counters_ui <- function(id) {
   ns <- NS(id)
-  div(class = "page",
+  div(class = "page page-continued",
     div(class = "page-head",
-      h2("Counters"),
+      h2("Individual counters"),
       p(class = "lede", "Every permanent counter the city runs, and what each one has seen.")
     ),
     div(class = "control-row",
@@ -38,10 +38,10 @@ counters_ui <- function(id) {
   )
 }
 
-counters_server <- function(id, bundle, clean_mode) {
+counters_server <- function(id, bundle) {
   moduleServer(id, function(input, output, session) {
 
-    counts <- reactive(counts_view(req(bundle())$counts, clean_mode()))
+    counts <- reactive(req(bundle())$counts)
 
     choices <- reactive({
       d <- counts()

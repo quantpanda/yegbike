@@ -50,10 +50,10 @@ trends_ui <- function(id) {
   )
 }
 
-trends_server <- function(id, bundle, clean_mode) {
+trends_server <- function(id, bundle) {
   moduleServer(id, function(input, output, session) {
 
-    counts <- reactive(counts_view(req(bundle())$counts, clean_mode()))
+    counts <- reactive(req(bundle())$counts)
 
     output$norm_note <- renderUI({
       msg <- switch(input$norm %||% "mean",

@@ -1,8 +1,9 @@
 # ---------------------------------------------------------------------------
-# Network -- what the bike network is actually made of, and when it was built.
+# About -- what the bike network is made of, and what the app corrects in the
+# City's counter data. Replaces the separate Network and Data quality tabs.
 # ---------------------------------------------------------------------------
 
-network_ui <- function(id) {
+about_ui <- function(id) {
   ns <- NS(id)
   div(class = "page",
     div(class = "page-head",
@@ -24,37 +25,49 @@ network_ui <- function(id) {
           "Construction year is recorded for only about 7% of segments, so this shows the shape of the build-out programme rather than its full extent.")
       )
     ),
-    card(full_screen = TRUE,
-      card_header("Route inventory"),
-      withSpinner(DTOutput(ns("table")), type = 8, color = PAL$cat[1])
+
+    div(class = "page-head page-head-section",
+      h2("Data quality"),
+      p(class = "lede",
+        "The City's counter data has real faults: a sensor that reported 86,235 cyclists in a February, duplicated days, and counters renamed mid-series. Every chart in this app uses the cleaned figures below.")
+    ),
+    div(class = "grid-2",
+      card(
+        card_header("Correction rules"),
+        withSpinner(DTOutput(ns("rules")), type = 8, color = PAL$cat[1]),
+        card_footer(class = "card-note",
+          "Rules that alter data replace a value with a gap; the rest only annotate.")
+      ),
+      card(full_screen = TRUE,
+        card_header("Before and after"),
+        withSpinner(plotlyOutput(ns("compare"), height = "320px"), type = 8, color = PAL$cat[1]),
+        card_footer(class = "card-note",
+          "City-wide daily cyclists per counter. The raw line's spikes are single malfunctioning sensors, not busy days.")
+      )
     )
   )
 }
 
-network_server <- function(id, bundle) {
+about_server <- function(id, bundle) {
   moduleServer(id, function(input, output, session) {
 
-    lengths_df <- reactive({
-      b <- req(bundle()); req(b$routes)
-      route_lengths(b$routes)
-    })
+    lengths_df <- reactive(route_lengths(req(req(bundle())$routes)))
 
     output$tiles <- renderUI({
-      b <- req(bundle())
+      r <- req(bundle()$routes)
       rl <- lengths_df()
       cyc_km <- sum(rl$km[rl$cycling])
-      protected <- sum(rl$km[rl$classification %in%
+      dedicated <- sum(rl$km[rl$classification %in%
         c("Protected Bike Lane", "Painted Bike Lane", "Contra-Flow Bike Lane")])
-      n_seg <- nrow(b$routes)
-      yr <- suppressWarnings(as.integer(b$routes$construction_year))
-      recent <- sum(!is.na(yr) & yr >= as.integer(format(Sys.Date(), "%Y")) - 5)
+      recent_from <- as.integer(format(Sys.Date(), "%Y")) - 5
+      recent <- sum(!is.na(r$construction_year) & r$construction_year >= recent_from)
 
       div(class = "tiles",
         stat_tile(sprintf("%s km", fmt_int(cyc_km)), "Cycling network", accent = PAL$cat[1]),
-        stat_tile(sprintf("%s km", fmt_int(protected)), "Dedicated bike lanes",
+        stat_tile(sprintf("%s km", fmt_int(dedicated)), "Dedicated bike lanes",
                   sub = "protected, painted or contra-flow", accent = PAL$cat[3]),
-        stat_tile(fmt_int(n_seg), "Route segments", accent = PAL$cat[4]),
-        stat_tile(fmt_int(recent), "Segments built since 2021",
+        stat_tile(fmt_int(nrow(r)), "Route segments", accent = PAL$cat[4]),
+        stat_tile(fmt_int(recent), sprintf("Segments built since %d", recent_from),
                   sub = "where a build year is recorded", accent = PAL$cat[5])
       )
     })
@@ -80,17 +93,14 @@ network_server <- function(id, bundle) {
     })
 
     output$buildout <- renderPlotly({
-      b <- req(bundle())
-      r <- b$routes
-      yr <- suppressWarnings(as.integer(r$construction_year))
+      r <- req(bundle()$routes)
+      yr <- r$construction_year
       keep <- !is.na(yr) & yr >= 2005 & yr <= as.integer(format(Sys.Date(), "%Y"))
       validate(need(any(keep), "No construction years recorded."))
 
-      len_km <- as.numeric(sf::st_length(sf::st_transform(r[keep, ], 3402))) / 1000
-      cls <- r$classification[keep]
-      dedicated <- cls %in% c("Protected Bike Lane", "Painted Bike Lane",
-                              "Contra-Flow Bike Lane", "Local Street Bikeway")
-      df <- data.frame(year = yr[keep], km = len_km,
+      dedicated <- r$classification[keep] %in% c("Protected Bike Lane", "Painted Bike Lane",
+                                                 "Contra-Flow Bike Lane", "Local Street Bikeway")
+      df <- data.frame(year = yr[keep], km = r$km[keep],
                        kind = ifelse(dedicated, "Dedicated bike lane", "Shared path or roadway"))
       agg <- stats::aggregate(km ~ year + kind, data = df, FUN = sum)
 
@@ -106,26 +116,38 @@ network_server <- function(id, bundle) {
                             tickfont = list(size = 11, color = PAL$muted)))
     })
 
-    output$table <- renderDT({
-      b <- req(bundle())
-      r <- sf::st_drop_geometry(b$routes)
-      rl <- lengths_df()
-      n_by <- as.data.frame(table(r$classification), stringsAsFactors = FALSE)
-      names(n_by) <- c("classification", "segments")
-      tab <- merge(rl, n_by, by = "classification")
-      out <- data.frame(
-        Classification = tab$classification,
-        `Cycling infrastructure` = ifelse(tab$cycling, "Yes", "No"),
-        Kilometres = round(tab$km, 1),
-        Segments = tab$segments,
-        `Share of network` = sprintf("%.1f%%", 100 * tab$km / sum(tab$km)),
+    output$rules <- renderDT({
+      s <- req(bundle()$qa_summary)
+      tab <- data.frame(
+        Rule = s$rule,
+        What = s$label,
+        Readings = s$n,
+        Effect = ifelse(s$destructive, "Alters data", "Annotates only"),
         check.names = FALSE, stringsAsFactors = FALSE
       )
-      out <- out[order(-out$Kilometres), ]
-      datatable(out, rownames = FALSE, class = "compact stripe hover",
-                options = list(pageLength = 12, dom = "t")) |>
-        formatStyle("Cycling infrastructure", color = styleEqual(
-          c("Yes", "No"), c(PAL$status[["good"]], PAL$muted)))
+      datatable(tab, rownames = FALSE, class = "compact stripe",
+                options = list(dom = "t", pageLength = 20)) |>
+        formatCurrency("Readings", "", digits = 0) |>
+        formatStyle("Effect", fontWeight = styleEqual("Alters data", "600"),
+                    color = styleEqual(c("Alters data", "Annotates only"),
+                                       c(PAL$status[["serious"]], PAL$muted)))
+    })
+
+    output$compare <- renderPlotly({
+      d <- req(bundle()$counts)
+      raw <- d
+      raw$cyc <- raw$cyc_raw
+      raw   <- daily_series(raw, "cyc", "mean")
+      clean <- daily_series(d,   "cyc", "mean")
+
+      plot_ly() |>
+        add_trace(data = raw, x = ~date, y = ~value, type = "scatter", mode = "lines",
+                  name = "Raw", line = list(color = PAL$cat[2], width = 1.4),
+                  hovertemplate = "%{x|%d %b %Y}<br>Raw <b>%{y:.0f}</b><extra></extra>") |>
+        add_trace(data = clean, x = ~date, y = ~value, type = "scatter", mode = "lines",
+                  name = "Cleaned", line = list(color = PAL$cat[1], width = 1.6),
+                  hovertemplate = "%{x|%d %b %Y}<br>Cleaned <b>%{y:.0f}</b><extra></extra>") |>
+        plotly_base(ylab = "Cyclists per counter per day", legend = TRUE)
     })
   })
 }

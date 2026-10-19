@@ -1,9 +1,10 @@
 # ---------------------------------------------------------------------------
 # YEG Bike -- Edmonton bike lane status and ridership
 #
-# Data is pulled from data.edmonton.ca at startup and re-pulled on demand from
-# the Refresh control in the header. Everything on disk under cache/ is a
-# convenience, never a source of truth.
+# Data is pulled from data.edmonton.ca once per server process and shared by
+# every session; the first visitor after it goes an hour stale triggers an
+# incremental reload. Everything on disk under cache/ is a convenience, never
+# a source of truth.
 #
 # Run:  Rscript -e 'shiny::runApp(".", port = 8080)'
 # ---------------------------------------------------------------------------
@@ -26,7 +27,7 @@ ui <- page_navbar(
     primary = PAL$cat[1],
     "border-color" = PAL$grid
   ),
-  fillable = c("Simulation", "Map"),
+  fillable = "Map",
 
   header = tagList(
     tags$head(
@@ -36,53 +37,23 @@ ui <- page_navbar(
     div(class = "app-status", uiOutput("status_bar"))
   ),
 
-  nav_panel("Overview",    overview_ui("ov")),
-  nav_panel("Map",         map_ui("map")),
-  nav_panel("Simulation",  simulation_ui("sim")),
-  nav_panel("Trends",      trends_ui("tr")),
-  nav_panel("Counters",    counters_ui("ct")),
-  nav_panel("Network",     network_ui("nw")),
-  nav_panel("Data quality", quality_ui("qa")),
-
-  nav_spacer(),
-  nav_item(
-    div(
-      class = "nav-tools",
-      div(class = "clean-switch",
-          tags$label(`for` = "clean_mode", "Cleaned data"),
-          tags$input(type = "checkbox", id = "clean_mode", class = "toggle", checked = NA)),
-      actionButton("refresh", label = tagList(icon("rotate"), "Refresh"),
-                   class = "btn btn-sm btn-refresh")
-    )
-  )
+  nav_panel("Overview", overview_ui("ov")),
+  nav_panel("Map",      map_ui("map")),
+  nav_panel("Trends",   trends_ui("tr"), counters_ui("ct")),
+  nav_panel("About",    about_ui("ab"))
 )
 
 server <- function(input, output, session) {
 
   # -- data bundle --------------------------------------------------------
-  bundle <- reactiveVal(NULL)
-
-  load_bundle <- function(force) {
-    withProgress(message = if (force) "Refreshing from data.edmonton.ca" else "Loading Edmonton open data",
-                 value = 0, {
-      b <- app_data(force = force, notify = function(label, frac) {
-        setProgress(value = frac, detail = label)
-      })
-      bundle(b)
+  # Shared across sessions (see shared_bundle() in R/data.R). Only the visitor
+  # who finds it missing or stale waits, and they get a progress bar.
+  bundle <- reactiveVal(
+    if (shared_bundle_fresh()) shared_bundle()
+    else withProgress(message = "Loading Edmonton open data", value = 0, {
+      shared_bundle(notify = function(label, frac) setProgress(value = frac, detail = label))
     })
-  }
-
-  # Pull on load, as required -- the disk cache only short-circuits the network
-  # inside each dataset's TTL, and Refresh always bypasses it.
-  load_bundle(force = FALSE)
-
-  observeEvent(input$refresh, {
-    load_bundle(force = TRUE)
-    showNotification("Data refreshed from the City of Edmonton.",
-                     type = "message", duration = 4)
-  })
-
-  clean_mode <- reactive(isTRUE(input$clean_mode))
+  )
 
   # -- header status ------------------------------------------------------
   output$status_bar <- renderUI({
@@ -109,7 +80,7 @@ server <- function(input, output, session) {
       failed <- names(log)[degraded]
       bits <- tagList(bits, div(
         class = "status-warn",
-        sprintf("Could not reach the portal for: %s. Showing the last good copy — press Refresh to retry.",
+        sprintf("Could not reach the portal for: %s. Showing the last good copy.",
                 paste(failed, collapse = ", "))
       ))
     }
@@ -117,13 +88,11 @@ server <- function(input, output, session) {
   })
 
   # -- modules ------------------------------------------------------------
-  overview_server("ov", bundle, clean_mode, session)
-  map_server("map", bundle, clean_mode)
-  simulation_server("sim", bundle)
-  trends_server("tr", bundle, clean_mode)
-  counters_server("ct", bundle, clean_mode)
-  network_server("nw", bundle)
-  quality_server("qa", bundle)
+  overview_server("ov", bundle)
+  map_server("map", bundle)
+  trends_server("tr", bundle)
+  counters_server("ct", bundle)
+  about_server("ab", bundle)
 }
 
 shinyApp(ui, server)

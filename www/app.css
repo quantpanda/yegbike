@@ -40,31 +40,6 @@ body {
 .navbar .nav-link { color: var(--ink-2) !important; font-size: 14px; }
 .navbar .nav-link.active { color: var(--ink) !important; font-weight: 600; }
 
-.nav-tools { display: flex; align-items: center; gap: 16px; padding-right: 4px; }
-
-.clean-switch {
-  display: flex; align-items: center; gap: 7px;
-  font-size: 12.5px; color: var(--ink-2); white-space: nowrap;
-}
-.clean-switch input.toggle {
-  appearance: none; width: 34px; height: 19px; border-radius: 999px;
-  background: var(--axis); position: relative; cursor: pointer;
-  transition: background 0.16s;
-}
-.clean-switch input.toggle::after {
-  content: ""; position: absolute; top: 2px; left: 2px;
-  width: 15px; height: 15px; border-radius: 50%; background: #fff;
-  transition: transform 0.16s; box-shadow: 0 1px 2px rgba(0,0,0,0.25);
-}
-.clean-switch input.toggle:checked { background: var(--accent); }
-.clean-switch input.toggle:checked::after { transform: translateX(15px); }
-.clean-switch input.toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-
-.btn-refresh {
-  background: var(--accent); border-color: var(--accent); color: #fff;
-  font-size: 12.5px; padding: 4px 12px; border-radius: 7px; white-space: nowrap;
-}
-.btn-refresh:hover { background: #256abf; border-color: #256abf; color: #fff; }
 
 .btn-ghost {
   background: transparent; border: 1px solid var(--grid); color: var(--ink-2);
@@ -96,7 +71,7 @@ body {
 /* -- page scaffolding ----------------------------------------------------- */
 
 .page { padding: 22px 24px 34px; max-width: 1500px; margin: 0 auto; }
-/* Full-bleed tabs (Map, Simulation).
+/* Full-bleed tab (Map).
    A concrete viewport height rather than height:100%, because 100% only works
    if every ancestor participates in bslib's fill chain -- and shinycssloaders
    wraps its output in a plain div, which breaks it. The subtracted 92px is the
@@ -104,6 +79,10 @@ body {
 .page-flush {
   padding: 0;
   max-width: none;
+  /* .page's auto margins shrink-wrap it inside bslib's flex tab pane, which
+     squeezed the map into the middle third of a wide window. */
+  margin: 0;
+  width: 100%;
   height: calc(100vh - 92px);
   min-height: 460px;
 }
@@ -112,7 +91,14 @@ body {
 .page-flush .shiny-spinner-output-container { height: 100%; }
 .page-flush .leaflet { min-height: 400px; }
 
+.swatch {
+  display: inline-block; width: 14px; height: 4px; border-radius: 2px;
+  margin-right: 7px; vertical-align: middle;
+}
+
 .page-head { margin-bottom: 18px; }
+.page-head-section { margin-top: 30px; }
+.page-continued { padding-top: 6px; }
 .page-head h2 { font-size: 21px; font-weight: 650; letter-spacing: -0.015em; margin: 0 0 3px; }
 .lede { color: var(--ink-2); font-size: 13.5px; margin: 0; max-width: 74ch; }
 
@@ -228,35 +214,3 @@ body {
 }
 .chip-link { color: var(--accent); text-decoration: none; }
 .chip-link:hover { background: rgba(42, 120, 214, 0.08); border-color: var(--accent); }
-
-/* -- simulation ----------------------------------------------------------- */
-
-.sim-wrap { height: 100%; min-height: 560px; padding: 12px; }
-
-/* -- tables --------------------------------------------------------------- */
-
-table.dataTable { font-size: 12.5px; }
-table.dataTable thead th {
-  font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em;
-  color: var(--muted); font-weight: 650;
-  border-bottom: 1px solid var(--axis) !important;
-}
-table.dataTable tbody td { border-top: 1px solid var(--grid) !important; }
-.dataTables_wrapper .dataTables_filter input {
-  border: 1px solid var(--grid); border-radius: 6px; padding: 3px 9px; font-size: 12.5px;
-}
-.dataTables_wrapper .dataTables_info,
-.dataTables_wrapper .dataTables_paginate { font-size: 11.5px !important; color: var(--muted) !important; }
-
-/* -- misc ----------------------------------------------------------------- */
-
-.leaflet-container { background: var(--plane); }
-.form-control, .selectize-input { font-size: 13px; border-color: var(--grid); }
-.shiny-input-container { margin-bottom: 10px; }
-.radio-inline, .checkbox-inline, .checkbox label { font-size: 13px; color: var(--ink-2); }
-
-@media (max-width: 900px) {
-  .page { padding: 16px 14px 28px; }
-  .grid-2 { grid-template-columns: 1fr; }
-  .app-status { gap: 10px; padding: 6px 14px; }
-}
